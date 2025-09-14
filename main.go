@@ -167,7 +167,6 @@ func main() {
 	var (
 		portFlag    = flag.String("p", "", "端口范围 (例如: 80, 1-1000, 80,81,82, 80-90,443)")
 		timeout     = flag.Duration("t", defaultTimeout, "连接超时时间")
-		workers     = flag.Int("w", defaultWorkers, "并发工作协程数")
 		showVersion = flag.Bool("v", false, "显示版本信息")
 		showHelp    = flag.Bool("h", false, "显示帮助信息")
 		standMode   = flag.Bool("stand", false, "")
@@ -181,7 +180,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -p string\t\t端口范围 (例如: 80, 1-1000, 80,81,82, 80-90,443)\n")
 		fmt.Fprintf(os.Stderr, "  -t duration\t\t连接超时时间 (default 3s)\n")
 		fmt.Fprintf(os.Stderr, "  -v\t\t\t显示版本信息\n")
-		fmt.Fprintf(os.Stderr, "  -w int\t\t并发工作协程数 (default 1000)\n")
 		fmt.Fprintf(os.Stderr, "\n输出模式:\n")
 		fmt.Fprintf(os.Stderr, "  --stand\t\t竖向输出：每行一个端口\n")
 		fmt.Fprintf(os.Stderr, "  --lie\t\t\t横向输出：逗号分隔的端口列表\n")
@@ -238,25 +236,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *workers > len(ports) {
-		*workers = len(ports)
+	// 自动计算worker数量：取端口数量和默认值中的较小值
+	workers := defaultWorkers
+	if workers > len(ports) {
+		workers = len(ports)
 	}
 
-	if !*standMode && !*lieMode {
-		fmt.Printf("scanning %s, ports: %d, workers: %d\n", target, len(ports), *workers)
-	}
+	fmt.Printf("scanning %s, ports: %d, workers: %d\n", target, len(ports), workers)
 
-	scanner := NewPortScanner(target, *timeout, *workers)
+	scanner := NewPortScanner(target, *timeout, workers)
 
 	startTime := time.Now()
 	openPorts := scanner.Scan(ports)
 	duration := time.Since(startTime)
 
 	if *standMode {
+		fmt.Printf("\nscan completed, time: %v\n", duration)
+		fmt.Printf("found %d open ports:\n", len(openPorts))
 		for _, port := range openPorts {
 			fmt.Printf("%d\n", port)
 		}
 	} else if *lieMode {
+		fmt.Printf("\nscan completed, time: %v\n", duration)
+		fmt.Printf("found %d open ports:\n", len(openPorts))
 		if len(openPorts) > 0 {
 			for i, port := range openPorts {
 				if i > 0 {
