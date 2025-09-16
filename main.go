@@ -272,10 +272,11 @@ func main() {
 	openPorts := scanner.Scan(ports, !*disableRealtime)
 	duration := time.Since(startTime)
 	fmt.Printf("\nscan completed, time: %v\n", duration)
-	fmt.Printf("found %d open ports\n\n", len(openPorts))
+	fmt.Printf("found %d open ports\n", len(openPorts))
 
 	if *lieMode {
 		if len(openPorts) > 0 {
+			fmt.Println()
 			for i, port := range openPorts {
 				if i > 0 {
 					fmt.Print(",")
@@ -286,6 +287,7 @@ func main() {
 		}
 	} else if *standMode {
 		if len(openPorts) > 0 {
+			fmt.Println()
 			for _, port := range openPorts {
 				fmt.Printf("%d\n", port)
 			}
