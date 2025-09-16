@@ -15,9 +15,17 @@ import (
 )
 
 const (
-	defaultTimeout = 2 * time.Second
-	defaultWorkers = 1000
+	defaultTimeout = 1 * time.Second
+	defaultWorkers = 5000
+	defaultRetries = 1
 )
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 type ScanResult struct {
 	Port int
@@ -28,15 +36,18 @@ type PortScanner struct {
 	target  string
 	timeout time.Duration
 	workers int
+	retries int
 	results chan ScanResult
 	wg      sync.WaitGroup
+	mutex   sync.Mutex
 }
 
-func NewPortScanner(target string, timeout time.Duration, workers int) *PortScanner {
+func NewPortScanner(target string, timeout time.Duration, workers int, retries int) *PortScanner {
 	return &PortScanner{
 		target:  target,
 		timeout: timeout,
 		workers: workers,
+		retries: retries,
 		results: make(chan ScanResult, workers),
 	}
 }
@@ -65,7 +76,6 @@ func parsePortRange(portStr string) ([]int, error) {
 				if err != nil || port < 1 || port > 65535 {
 					return nil, fmt.Errorf("port error")
 				}
-
 				ports = append(ports, port)
 			}
 		}
@@ -80,7 +90,6 @@ func parsePortRange(portStr string) ([]int, error) {
 		if err != nil || port < 1 || port > 65535 {
 			return nil, fmt.Errorf("port error")
 		}
-
 		ports = append(ports, port)
 	}
 	return ports, nil
@@ -106,30 +115,64 @@ func parseRange(rangeStr string) ([]int, error) {
 func (ps *PortScanner) scanPort(ctx context.Context, port int) {
 	defer ps.wg.Done()
 	address := fmt.Sprintf("%s:%d", ps.target, port)
-	dialer := &net.Dialer{Timeout: ps.timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", address)
-	if err != nil {
-		ps.results <- ScanResult{Port: port, Open: false}
-		return
+	var isOpen bool
+
+	for attempt := 0; attempt <= ps.retries; attempt++ {
+		connCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+		dialer := &net.Dialer{Timeout: ps.timeout}
+		conn, err := dialer.DialContext(connCtx, "tcp", address)
+		cancel()
+
+		if err == nil {
+			conn.Close()
+			isOpen = true
+			break
+		} else {
+			netErr, ok := err.(net.Error)
+			if ok && netErr.Timeout() {
+				continue
+			}
+			break
+		}
 	}
-	conn.Close()
-	ps.results <- ScanResult{Port: port, Open: true}
+
+	ps.results <- ScanResult{Port: port, Open: isOpen}
 }
 
-func (ps *PortScanner) Scan(ports []int) []int {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(ports))*ps.timeout)
+func (ps *PortScanner) Scan(ports []int, realtimeOutput bool) []int {
+	maxScanTime := 5 * time.Minute
+	if time.Duration(len(ports))*ps.timeout < maxScanTime {
+		maxScanTime = time.Duration(len(ports)) * ps.timeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maxScanTime)
 	defer cancel()
+
 	semaphore := make(chan struct{}, ps.workers)
 	var openPorts []int
 	done := make(chan bool)
+
 	go func() {
 		for result := range ps.results {
 			if result.Open {
-				openPorts = append(openPorts, result.Port)
+				ps.mutex.Lock()
+				insertIndex := sort.SearchInts(openPorts, result.Port)
+				if insertIndex < len(openPorts) && openPorts[insertIndex] == result.Port {
+					ps.mutex.Unlock()
+					continue
+				}
+				openPorts = append(openPorts, 0)
+				copy(openPorts[insertIndex+1:], openPorts[insertIndex:])
+				openPorts[insertIndex] = result.Port
+				ps.mutex.Unlock()
+
+				if realtimeOutput {
+					fmt.Printf("OPEN %s:%d [TCP]\n", ps.target, result.Port)
+				}
 			}
 		}
 		done <- true
 	}()
+
 	for _, port := range ports {
 		ps.wg.Add(1)
 		semaphore <- struct{}{}
@@ -139,33 +182,38 @@ func (ps *PortScanner) Scan(ports []int) []int {
 			ps.scanPort(ctx, p)
 		}(port)
 	}
+
 	ps.wg.Wait()
 	close(ps.results)
 	<-done
-	sort.Ints(openPorts)
+
 	return openPorts
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	var (
-		portFlag    = flag.String("p", "", "端口范围 (例如: 80, 1-1000, 80,81,82, 80-90,443)")
-		timeout     = flag.Duration("t", defaultTimeout, "连接超时时间")
-		showVersion = flag.Bool("v", false, "显示版本信息")
-		showHelp    = flag.Bool("h", false, "显示帮助信息")
-		standMode   = flag.Bool("stand", false, "")
-		lieMode     = flag.Bool("lie", false, "")
+		portFlag        = flag.String("p", "", "")
+		timeout         = flag.Duration("t", defaultTimeout, "")
+		showVersion     = flag.Bool("v", false, "")
+		showHelp        = flag.Bool("h", false, "")
+		standMode       = flag.Bool("stand", false, "")
+		lieMode         = flag.Bool("lie", false, "")
+		disableRealtime = flag.Bool("norealtime", false, "")
+		retries         = flag.Int("retries", defaultRetries, "")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "\n用法: %s <目标主机> [选项]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\n选项:\n")
 		fmt.Fprintf(os.Stderr, "  -h\t\t\t显示帮助信息\n")
 		fmt.Fprintf(os.Stderr, "  -p string\t\t端口范围 (例如: 80, 1-1000, 80,81,82, 80-90,443)\n")
-		fmt.Fprintf(os.Stderr, "  -t duration\t\t连接超时时间 (default 3s)\n")
+		fmt.Fprintf(os.Stderr, "  -t duration\t\t连接超时时间 (default 1s)\n")
 		fmt.Fprintf(os.Stderr, "  -v\t\t\t显示版本信息\n")
+		fmt.Fprintf(os.Stderr, "  --retries int\t\t连接失败时的重试次数 (default %d)\n", defaultRetries)
 		fmt.Fprintf(os.Stderr, "\n输出模式:\n")
 		fmt.Fprintf(os.Stderr, "  --stand\t\t竖向输出：每行一个端口\n")
 		fmt.Fprintf(os.Stderr, "  --lie\t\t\t横向输出：逗号分隔的端口列表\n")
+		fmt.Fprintf(os.Stderr, "  --norealtime\t\t禁用实时输出开放的端口\n")
 	}
 	flag.Parse()
 	if *showVersion {
@@ -188,6 +236,8 @@ func main() {
 			*standMode = true
 		} else if arg == "--lie" {
 			*lieMode = true
+		} else if arg == "--norealtime" {
+			*disableRealtime = true
 		} else if !strings.HasPrefix(arg, "-") && target == "" {
 			target = arg
 		}
@@ -213,20 +263,18 @@ func main() {
 	if workers > len(ports) {
 		workers = len(ports)
 	}
-	fmt.Printf("scanning %s, ports: %d, workers: %d\n", target, len(ports), workers)
-	scanner := NewPortScanner(target, *timeout, workers)
+	if len(ports) > 10000 {
+		workers = min(workers, 10000)
+	}
+	fmt.Printf("scanning %s, ports: %d, workers: %d, timeout: %v, retries: %d\n\n", target, len(ports), workers, *timeout, *retries)
+	scanner := NewPortScanner(target, *timeout, workers, *retries)
 	startTime := time.Now()
-	openPorts := scanner.Scan(ports)
+	openPorts := scanner.Scan(ports, !*disableRealtime)
 	duration := time.Since(startTime)
-	if *standMode {
-		fmt.Printf("\nscan completed, time: %v\n", duration)
-		fmt.Printf("found %d open ports:\n", len(openPorts))
-		for _, port := range openPorts {
-			fmt.Printf("%d\n", port)
-		}
-	} else if *lieMode {
-		fmt.Printf("\nscan completed, time: %v\n", duration)
-		fmt.Printf("found %d open ports:\n", len(openPorts))
+	fmt.Printf("\nscan completed, time: %v\n", duration)
+	fmt.Printf("found %d open ports\n\n", len(openPorts))
+
+	if *lieMode {
 		if len(openPorts) > 0 {
 			for i, port := range openPorts {
 				if i > 0 {
@@ -236,13 +284,18 @@ func main() {
 			}
 			fmt.Println()
 		}
-	} else {
-		fmt.Printf("\nscan completed, time: %v\n", duration)
-		fmt.Printf("found %d open ports:\n", len(openPorts))
-		for _, port := range openPorts {
-			fmt.Printf("%d/tcp open\n", port)
+	} else if *standMode {
+		if len(openPorts) > 0 {
+			for _, port := range openPorts {
+				fmt.Printf("%d\n", port)
+			}
 		}
-		if len(openPorts) == 0 {
+	} else if *disableRealtime {
+		if len(openPorts) > 0 {
+			for _, port := range openPorts {
+				fmt.Printf("OPEN %s:%d [TCP]\n", target, port)
+			}
+		} else {
 			fmt.Println("no open ports found")
 		}
 	}
